@@ -17,10 +17,13 @@ export type ColorVectorSettings = {
 }
 
 export const DEFAULT_COLOR_VECTOR_SETTINGS: ColorVectorSettings = {
+  // Pinheads masters usually land ~6–10 solid fills
   colorCount: 8,
-  minRegionRatio: 0.0004,
-  smoothness: 2,
-  maxDim: 900,
+  // Light cleanup — keep small features (stars, eyes) pourable but kill dust
+  minRegionRatio: 0.00035,
+  // Minimal smoothing so hard metal-ready edges stay sharp
+  smoothness: 0,
+  maxDim: 1200,
   snapToPms: true,
 }
 
@@ -47,7 +50,11 @@ export type ColorVectorResult = {
   state: ColorVectorState
 }
 
-function scaleToCanvas(
+/**
+ * Scale source into working ImageData. Does NOT punch the subject away —
+ * background removal happens after quantize via edge-connected white only.
+ */
+export function scaleToCanvas(
   source: HTMLImageElement | ImageBitmap,
   maxDim: number,
 ): ImageData {
@@ -60,16 +67,80 @@ function scaleToCanvas(
   canvas.width = w
   canvas.height = h
   const ctx = canvas.getContext('2d', { willReadFrequently: true })!
+  // Opaque white underlay so JPEG edges don't get weird alpha
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, w, h)
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
   ctx.drawImage(source, 0, 0, w, h)
   return ctx.getImageData(0, 0, w, h)
 }
 
+/**
+ * After quantize: clear backdrop colors connected to the image border.
+ * Handles Pinheads-style plain white OR plain black studio backgrounds.
+ * Interior whites/blacks (eyes, metal-look fills) stay if not edge-connected.
+ */
+export function clearEdgeConnectedBackground(
+  labels: Uint16Array,
+  palette: Rgb[],
+  width: number,
+  height: number,
+): Uint16Array {
+  const bgColors = new Set<number>()
+  for (let i = 0; i < palette.length; i++) {
+    const { r, g, b } = palette[i]
+    const min = Math.min(r, g, b)
+    const max = Math.max(r, g, b)
+    const chroma = max - min
+    // Paper white / cream
+    if (min >= 242 && chroma <= 20) bgColors.add(i)
+    // Studio pure black backdrop (not mid-grays used as fills)
+    if (max <= 18 && chroma <= 12) bgColors.add(i)
+  }
+  if (bgColors.size === 0) return labels
+
+  const out = new Uint16Array(labels)
+  const n = width * height
+  const seen = new Uint8Array(n)
+  const stack: number[] = []
+
+  const tryPush = (i: number) => {
+    if (i < 0 || i >= n || seen[i]) return
+    const v = out[i]
+    if (v === 0xffff || !bgColors.has(v)) return
+    seen[i] = 1
+    stack.push(i)
+  }
+
+  for (let x = 0; x < width; x++) {
+    tryPush(x)
+    tryPush((height - 1) * width + x)
+  }
+  for (let y = 0; y < height; y++) {
+    tryPush(y * width)
+    tryPush(y * width + width - 1)
+  }
+
+  while (stack.length) {
+    const i = stack.pop()!
+    out[i] = 0xffff
+    const x = i % width
+    const y = (i / width) | 0
+    if (x > 0) tryPush(i - 1)
+    if (x < width - 1) tryPush(i + 1)
+    if (y > 0) tryPush(i - width)
+    if (y < height - 1) tryPush(i + width)
+  }
+  return out
+}
+
 function processContour(points: Point[], smoothness: number): Point[] {
-  const epsilon = 0.55 + (5 - Math.min(5, smoothness)) * 0.12
+  const epsilon = 0.4 + (5 - Math.min(5, smoothness)) * 0.1
   let pts = simplifyPath(points, epsilon)
   if (smoothness > 0) {
     pts = smoothPath(pts, smoothness)
-    pts = simplifyPath(pts, Math.max(0.25, epsilon * 0.5))
+    pts = simplifyPath(pts, Math.max(0.2, epsilon * 0.5))
   }
   return pts
 }
@@ -101,14 +172,6 @@ function buildMergeMap(colorCount: number, merges: Array<[number, number]>): num
 }
 
 function averageMergedPalette(palette: Rgb[], labels: Uint16Array, mergeMap: number[]): Rgb[] {
-  const sums = palette.map(() => ({ r: 0, g: 0, b: 0, n: 0 }))
-  for (let i = 0; i < palette.length; i++) {
-    const t = mergeMap[i]
-    sums[t].r += palette[i].r
-    sums[t].g += palette[i].g
-    sums[t].b += palette[i].b
-    sums[t].n += 1
-  }
   const pix = palette.map(() => ({ r: 0, g: 0, b: 0, n: 0 }))
   for (let i = 0; i < labels.length; i++) {
     const v = labels[i]
@@ -119,7 +182,7 @@ function averageMergedPalette(palette: Rgb[], labels: Uint16Array, mergeMap: num
     pix[t].b += palette[v].b
     pix[t].n += 1
   }
-  return palette.map((_, i) => {
+  return palette.map((c, i) => {
     if (pix[i].n > 0) {
       return {
         r: Math.round(pix[i].r / pix[i].n),
@@ -127,14 +190,7 @@ function averageMergedPalette(palette: Rgb[], labels: Uint16Array, mergeMap: num
         b: Math.round(pix[i].b / pix[i].n),
       }
     }
-    if (sums[i].n > 0) {
-      return {
-        r: Math.round(sums[i].r / sums[i].n),
-        g: Math.round(sums[i].g / sums[i].n),
-        b: Math.round(sums[i].b / sums[i].n),
-      }
-    }
-    return palette[i]
+    return { ...c }
   })
 }
 
@@ -196,7 +252,6 @@ function resolvePaletteColors(
     }
   }
 
-  // Only return used colors in meta list order
   const usedMeta = usedIndices
     .filter((i) => i >= 0 && i < meta.length)
     .sort((a, b) => a - b)
@@ -225,14 +280,42 @@ function stateToSvg(
     )
     .join('\n')
 
+  // Dominant edge color as underlay so no checkerboard holes show through
+  let underlay = '#ffffff'
+  const edgeCounts = new Map<number, number>()
+  for (let x = 0; x < widthPx; x++) {
+    const t = labels[x]
+    const b = labels[(heightPx - 1) * widthPx + x]
+    if (t !== 0xffff) edgeCounts.set(t, (edgeCounts.get(t) ?? 0) + 1)
+    if (b !== 0xffff) edgeCounts.set(b, (edgeCounts.get(b) ?? 0) + 1)
+  }
+  for (let y = 0; y < heightPx; y++) {
+    const l = labels[y * widthPx]
+    const r = labels[y * widthPx + widthPx - 1]
+    if (l !== 0xffff) edgeCounts.set(l, (edgeCounts.get(l) ?? 0) + 1)
+    if (r !== 0xffff) edgeCounts.set(r, (edgeCounts.get(r) ?? 0) + 1)
+  }
+  let bestEdge = -1
+  let bestEdgeN = 0
+  for (const [idx, n] of edgeCounts) {
+    if (n > bestEdgeN) {
+      bestEdgeN = n
+      bestEdge = idx
+    }
+  }
+  if (bestEdge >= 0 && fillRgb[bestEdge]) {
+    underlay = rgbToHex(fillRgb[bestEdge])
+  }
+
   const parts: string[] = [
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${widthPx} ${heightPx}" width="${widthPx}" height="${heightPx}">`,
     `<!-- PMS Solid Coated palette\n${legend}\n-->`,
+    `<rect id="underlay" width="${widthPx}" height="${heightPx}" fill="${underlay}"/>`,
     '<g id="fills">',
   ]
 
   for (const [colorIndex, contours] of contoursByColor) {
-    const fill = rgbToHex(fillRgb[colorIndex])
+    const fill = rgbToHex(fillRgb[colorIndex] ?? { r: 128, g: 128, b: 128 })
     const meta = metaByIndex.get(colorIndex)
     const pmsAttr = meta?.pmsCode ? ` data-pms="${meta.pmsCode}"` : ''
     for (const contour of contours) {
@@ -301,8 +384,68 @@ function assemble(
   return packResult(svg, widthPx, heightPx, meta, regionCount, state)
 }
 
+
 /**
- * Vectorizer.AI-style flat color vectorization with optional PMS snapping.
+ * Near-black pixels are treated as outline ink — reassign them to neighboring
+ * fill colors so the vector plate is *all areas except outline*, fully covered.
+ */
+function peelOutlineInkToNeighborFills(
+  labels: Uint16Array,
+  palette: Rgb[],
+  width: number,
+  height: number,
+  passes = 4,
+): Uint16Array {
+  const isInk = (idx: number) => {
+    if (idx === 0xffff) return true
+    const c = palette[idx]
+    if (!c) return false
+    return Math.max(c.r, c.g, c.b) <= 42
+  }
+
+  let cur = new Uint16Array(labels)
+  for (let pass = 0; pass < passes; pass++) {
+    const next = new Uint16Array(cur)
+    let changed = 0
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = y * width + x
+        if (!isInk(cur[i])) continue
+        const counts = new Map<number, number>()
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (!dx && !dy) continue
+            const nx = x + dx
+            const ny = y + dy
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue
+            const v = cur[ny * width + nx]
+            if (v === 0xffff || isInk(v)) continue
+            counts.set(v, (counts.get(v) ?? 0) + 1)
+          }
+        }
+        let best = -1
+        let bestN = 0
+        for (const [v, n] of counts) {
+          if (n > bestN) {
+            bestN = n
+            best = v
+          }
+        }
+        if (best >= 0) {
+          next[i] = best
+          changed++
+        }
+      }
+    }
+    cur = next
+    if (!changed) break
+  }
+  return cur
+}
+
+/**
+ * Flat color vectorization — full coverage of every image area except outline ink.
+ * No transparent holes in the subject / scene.
  */
 export async function vectorizeColors(
   source: HTMLImageElement | ImageBitmap,
@@ -312,15 +455,22 @@ export async function vectorizeColors(
 ): Promise<ColorVectorResult> {
   const imageData = scaleToCanvas(source, settings.maxDim)
   const { width, height } = imageData
-  const palette = extractPalette(imageData, settings.colorCount)
+  // Extra fill colors help cover small regions without leaving gaps
+  const palette = extractPalette(imageData, Math.max(settings.colorCount, 6))
   let labels = quantizeImage(imageData, palette)
-  labels = denoiseLabels(labels, width, height, 2)
+  // Outline ink (near-black) becomes neighboring fills so vector = solid areas only
+  labels = peelOutlineInkToNeighborFills(labels, palette, width, height, 5)
+  labels = denoiseLabels(labels, width, height, 3)
+  // Do NOT punch edge backgrounds — user wants ALL areas filled
 
   const minArea = Math.max(
     8,
     Math.round(width * height * settings.minRegionRatio),
   )
   labels = mergeSmallRegions(labels, width, height, minArea)
+  // Second peel after merge (merge can reintroduce black islands)
+  labels = peelOutlineInkToNeighborFills(labels, palette, width, height, 2)
+  labels = denoiseLabels(labels, width, height, 1)
 
   const mergeMap = buildMergeMap(palette.length, merges)
   const mergedLabels = applyMergeMap(labels, mergeMap)

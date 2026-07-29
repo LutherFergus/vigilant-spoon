@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { DualOutputResult } from '../lib/pipeline'
 
-export type PreviewTab = 'source' | 'outline' | 'vector'
+export type PreviewTab = 'source' | 'outline' | 'vector' | 'proof'
 
 type Props = {
   viewMode: PreviewTab
@@ -25,10 +25,10 @@ export function Preview({ viewMode, sourceUrl, result, busy }: Props) {
     return (
       <div className="preview-stage">
         <div className="empty-state">
-          <h3>Upload or generate</h3>
+          <h3>Upload artwork</h3>
           <p>
-            You’ll get two assets: a transparent stroke-outline PNG, and a flat-color
-            vector SVG you can reduce by merging palette colors.
+            Drop a concept image. We’ll build outline, flat color vector, and a combined
+            proof (fills + lines) — like your elephant jack-in-the-box plates.
           </p>
         </div>
       </div>
@@ -36,17 +36,22 @@ export function Preview({ viewMode, sourceUrl, result, busy }: Props) {
   }
 
   return (
-    <div className="preview-stage checker" aria-busy={busy}>
+    <div
+      className={`preview-stage ${viewMode === 'proof' ? 'proof-stage' : 'checker'}`}
+      aria-busy={busy}
+    >
       {viewMode === 'source' && sourceUrl ? (
         <img src={sourceUrl} alt="Source artwork" />
       ) : viewMode === 'outline' && result ? (
-        <img src={result.outline.pngUrl} alt="Stroke outline on transparent background" />
+        <img src={result.outline.pngUrl} alt="Outline plate" />
       ) : viewMode === 'vector' && vectorUrl ? (
-        <img src={vectorUrl} alt="Color-quantized vector preview" />
+        <img src={vectorUrl} alt="Flat color vector" />
+      ) : viewMode === 'proof' && result ? (
+        <img src={result.proof.pngUrl} alt="Combined pin proof" />
       ) : (
         <div className="empty-state">
           <h3>Processing</h3>
-          <p>Building outline and vector outputs…</p>
+          <p>Building outline, vector, and proof…</p>
         </div>
       )}
     </div>

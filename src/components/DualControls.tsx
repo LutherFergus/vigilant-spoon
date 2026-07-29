@@ -4,9 +4,10 @@ type Props = {
   settings: DualOutputSettings
   onChange: (next: DualOutputSettings) => void
   disabled?: boolean
+  live?: boolean
 }
 
-export function DualControls({ settings, onChange, disabled }: Props) {
+export function DualControls({ settings, onChange, disabled, live }: Props) {
   const patchOutline = (partial: Partial<DualOutputSettings['outline']>) => {
     onChange({ ...settings, outline: { ...settings.outline, ...partial } })
   }
@@ -15,11 +16,18 @@ export function DualControls({ settings, onChange, disabled }: Props) {
   }
 
   return (
-    <div>
-      <h2>Stroke outline (PNG)</h2>
+    <div className="live-controls">
+      {live ? (
+        <div className="live-banner">
+          <span className="live-dot" aria-hidden />
+          Live — sliders update outline & vector
+        </div>
+      ) : null}
+
+      <h2>Outline · color separators</h2>
       <div className="field">
         <label>
-          <span>Sensitivity</span>
+          <span>Detail</span>
           <span className="value">{settings.outline.sensitivity}</span>
         </label>
         <input
@@ -34,7 +42,7 @@ export function DualControls({ settings, onChange, disabled }: Props) {
       </div>
       <div className="field">
         <label>
-          <span>Stroke thickness</span>
+          <span>Stroke weight</span>
           <span className="value">{settings.outline.thickness}px</span>
         </label>
         <input
@@ -47,12 +55,11 @@ export function DualControls({ settings, onChange, disabled }: Props) {
           onChange={(e) => patchOutline({ thickness: Number(e.target.value) })}
         />
       </div>
-      <p className="hint">Transparent PNG of line strokes only — no fills.</p>
 
-      <h2>Color vector (SVG)</h2>
+      <h2>Vector · flat quantize</h2>
       <div className="field">
         <label>
-          <span>Color count</span>
+          <span>Colors</span>
           <span className="value">{settings.vector.colorCount}</span>
         </label>
         <input
@@ -65,10 +72,6 @@ export function DualControls({ settings, onChange, disabled }: Props) {
           onChange={(e) => patchVector({ colorCount: Number(e.target.value) })}
         />
       </div>
-      <p className="hint">
-        Like Vectorizer.AI — flatten to N colors, then merge swatches or reassign PMS below.
-      </p>
-
       <label className="check-row">
         <input
           type="checkbox"
@@ -76,11 +79,8 @@ export function DualControls({ settings, onChange, disabled }: Props) {
           disabled={disabled}
           onChange={(e) => patchVector({ snapToPms: e.target.checked })}
         />
-        <span>Snap fills to PMS Solid Coated</span>
+        <span>Snap to PMS enamel chart</span>
       </label>
-      <p className="hint">
-        Maps each fill to the nearest Pantone code used for soft enamel pin matching.
-      </p>
       <div className="field">
         <label>
           <span>Smoothness</span>
@@ -98,7 +98,7 @@ export function DualControls({ settings, onChange, disabled }: Props) {
       </div>
       <div className="field">
         <label>
-          <span>Detail cleanup</span>
+          <span>Cleanup</span>
           <span className="value">
             {(settings.vector.minRegionRatio * 10000).toFixed(1)}
           </span>
@@ -115,7 +115,7 @@ export function DualControls({ settings, onChange, disabled }: Props) {
           }
         />
       </div>
-      <p className="hint">Higher cleanup merges tiny speckles before tracing.</p>
+      <p className="hint tight">Higher cleanup merges tiny speckles before tracing.</p>
     </div>
   )
 }

@@ -1,11 +1,10 @@
-import { useCallback, useEffect, useMemo, useState, useTransition } from 'react'
-import { AiGenerate } from './components/AiGenerate'
+import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react'
 import { DualControls } from './components/DualControls'
 import { Dropzone } from './components/Dropzone'
 import { PaletteMerge } from './components/PaletteMerge'
 import { PmsChartModal } from './components/PmsChartModal'
 import { Preview, type PreviewTab } from './components/Preview'
-import { generateAiImage, type PinheadsTheme } from './lib/aiGenerate'
+import { PromptProducer } from './components/PromptProducer'
 import type { PmsOverrides } from './lib/colorVectorize'
 import {
   createDualOutputs,
@@ -18,11 +17,11 @@ import {
 import { getPmsChartSize } from './lib/pms'
 import { loadImageFromFile } from './lib/vectorize'
 
-type SourceMode = 'upload' | 'ai'
+type Mode = 'prompt' | 'studio'
 
 export default function App() {
+  const [mode, setMode] = useState<Mode>('studio')
   const [settings, setSettings] = useState<DualOutputSettings>(DEFAULT_DUAL_SETTINGS)
-  const [sourceMode, setSourceMode] = useState<SourceMode>('upload')
   const [sourceName, setSourceName] = useState('artwork')
   const [sourceUrl, setSourceUrl] = useState<string | null>(null)
   const [sourceImage, setSourceImage] = useState<HTMLImageElement | null>(null)
@@ -31,17 +30,117 @@ export default function App() {
   const [pmsOverrides, setPmsOverrides] = useState<PmsOverrides>({})
   const [chartOpen, setChartOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [viewMode, setViewMode] = useState<PreviewTab>('vector')
+  const [viewMode, setViewMode] = useState<PreviewTab>('proof')
   const [isPending, startTransition] = useTransition()
   const [busy, setBusy] = useState(false)
+  const [liveBusy, setLiveBusy] = useState(false)
+
+  const settingsRef = useRef(settings)
+  settingsRef.current = settings
+  const sourceImageRef = useRef(sourceImage)
+  sourceImageRef.current = sourceImage
+  const liveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const liveGen = useRef(0)
 
   useEffect(() => {
     return () => {
       if (sourceUrl) URL.revokeObjectURL(sourceUrl)
       revokeDualUrls(result)
+      if (liveTimer.current) clearTimeout(liveTimer.current)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- unmount cleanup only
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  const runPipeline = useCallback(
+    async (
+      image: HTMLImageElement,
+      nextSettings: DualOutputSettings,
+      nextMerges: Array<[number, number]>,
+      nextOverrides: PmsOverrides,
+      opts?: { quiet?: boolean },
+    ) => {
+      if (!opts?.quiet) setBusy(true)
+      else setLiveBusy(true)
+      setError(null)
+      const gen = ++liveGen.current
+      try {
+        await new Promise((r) => setTimeout(r, 8))
+        const next = await createDualOutputs(
+          image,
+          nextSettings,
+          nextMerges,
+          nextOverrides,
+        )
+        if (gen !== liveGen.current) {
+          revokeDualUrls(next)
+          return
+        }
+        startTransition(() => {
+          setResult((prev) => {
+            revokeDualUrls(prev)
+            return next
+          })
+        })
+      } catch (err) {
+        if (gen === liveGen.current) {
+          setError(err instanceof Error ? err.message : 'Processing failed')
+        }
+      } finally {
+        if (gen === liveGen.current) {
+          setBusy(false)
+          setLiveBusy(false)
+        }
+      }
+    },
+    [],
+  )
+
+  const scheduleLivePipeline = useCallback(
+    (nextSettings: DualOutputSettings) => {
+      if (!sourceImageRef.current) return
+      if (liveTimer.current) clearTimeout(liveTimer.current)
+      liveTimer.current = setTimeout(() => {
+        const img = sourceImageRef.current
+        if (!img) return
+        setMerges([])
+        setPmsOverrides({})
+        void runPipeline(img, nextSettings, [], {}, { quiet: true })
+      }, 300)
+    },
+    [runPipeline],
+  )
+
+  const onSettingsChange = useCallback(
+    (next: DualOutputSettings) => {
+      setSettings(next)
+      scheduleLivePipeline(next)
+    },
+    [scheduleLivePipeline],
+  )
+
+  const onFile = useCallback(
+    async (file: File) => {
+      setError(null)
+      try {
+        const img = await loadImageFromFile(file)
+        const url = URL.createObjectURL(file)
+        setSourceUrl((prev) => {
+          if (prev) URL.revokeObjectURL(prev)
+          return url
+        })
+        setSourceImage(img)
+        setSourceName(file.name.replace(/\.[^.]+$/, '') || 'artwork')
+        setMerges([])
+        setPmsOverrides({})
+        setMode('studio')
+        setViewMode('proof')
+        await runPipeline(img, settingsRef.current, [], {})
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Could not load image')
+      }
+    },
+    [runPipeline],
+  )
 
   const refreshVector = useCallback(
     async (
@@ -50,116 +149,27 @@ export default function App() {
       nextSettings: DualOutputSettings = settings,
     ) => {
       if (!result) return
-      setBusy(true)
+      setLiveBusy(true)
       setError(null)
       try {
-        const vector = await remergeVector(
-          result.vector,
+        const next = await remergeVector(
+          result,
           nextMerges,
           nextSettings.vector.smoothness,
           nextSettings.vector.snapToPms,
           nextOverrides,
         )
         startTransition(() => {
-          setResult((prev) => {
-            if (!prev) return prev
-            URL.revokeObjectURL(prev.vector.svgUrl)
-            return { ...prev, vector }
-          })
-          setViewMode('vector')
+          setResult(next)
         })
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Palette update failed')
       } finally {
-        setBusy(false)
+        setLiveBusy(false)
       }
     },
     [result, settings],
   )
-
-  const runPipeline = useCallback(
-    async (
-      image: HTMLImageElement,
-      nextSettings: DualOutputSettings,
-      nextMerges: Array<[number, number]>,
-      nextOverrides: PmsOverrides,
-    ) => {
-      setBusy(true)
-      setError(null)
-      try {
-        await new Promise((r) => setTimeout(r, 16))
-        const next = await createDualOutputs(
-          image,
-          nextSettings,
-          nextMerges,
-          nextOverrides,
-        )
-        startTransition(() => {
-          setResult((prev) => {
-            revokeDualUrls(prev)
-            return next
-          })
-          setViewMode('vector')
-        })
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Processing failed')
-      } finally {
-        setBusy(false)
-      }
-    },
-    [],
-  )
-
-  const setSource = useCallback((image: HTMLImageElement, url: string, name: string) => {
-    setSourceUrl((prev) => {
-      if (prev) URL.revokeObjectURL(prev)
-      return url
-    })
-    setSourceImage(image)
-    setSourceName(name)
-    setMerges([])
-    setPmsOverrides({})
-  }, [])
-
-  const onFile = useCallback(
-    async (file: File) => {
-      setError(null)
-      try {
-        const img = await loadImageFromFile(file)
-        const url = URL.createObjectURL(file)
-        setSource(img, url, file.name.replace(/\.[^.]+$/, '') || 'artwork')
-        setSourceMode('upload')
-        await runPipeline(img, settings, [], {})
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Could not load image')
-      }
-    },
-    [runPipeline, setSource, settings],
-  )
-
-  const onGenerate = useCallback(
-    async (prompt: string, themes: PinheadsTheme[]) => {
-      setBusy(true)
-      setError(null)
-      try {
-        const gen = await generateAiImage({ prompt, themes })
-        setSource(gen.image, gen.objectUrl, slugify(prompt))
-        setSourceMode('ai')
-        await runPipeline(gen.image, settings, [], {})
-      } catch (err) {
-        setBusy(false)
-        setError(err instanceof Error ? err.message : 'Generation failed')
-      }
-    },
-    [runPipeline, setSource, settings],
-  )
-
-  const onApply = useCallback(() => {
-    if (!sourceImage) return
-    setMerges([])
-    setPmsOverrides({})
-    void runPipeline(sourceImage, settings, [], {})
-  }, [runPipeline, settings, sourceImage])
 
   const onMergesChange = useCallback(
     async (nextMerges: Array<[number, number]>) => {
@@ -188,143 +198,193 @@ export default function App() {
     downloadBlob(result.vector.svgBlob, `${sourceName}-vector.svg`)
   }, [result, sourceName])
 
+  const downloadProof = useCallback(() => {
+    if (!result) return
+    downloadBlob(result.proof.pngBlob, `${sourceName}-proof.png`)
+  }, [result, sourceName])
+
   const statusText = useMemo(() => {
-    if (busy || isPending) return 'Building stroke outline and color vector…'
     if (error) return error
-    if (!result) return 'Upload an image or generate one with AI'
+    if (busy || isPending || liveBusy) return 'Updating outline, vector & proof…'
+    if (!sourceImage) return 'Upload art to build outline · vector · proof plates'
+    if (!result) return 'Processing…'
     const pmsCount = result.vector.palette.filter((c) => c.pmsCode).length
-    return `Outline PNG · ${result.vector.palette.length} fills · ${pmsCount} PMS · ${result.vector.regionCount} shapes`
-  }, [busy, error, isPending, result])
+    return `Proof ready · ${result.vector.palette.length} fills · ${pmsCount} PMS · ${result.vector.regionCount} shapes`
+  }, [busy, error, isPending, liveBusy, result, sourceImage])
 
   return (
     <div className="app">
-      <header className="hero">
-        <h1 className="brand">Enamel Pin Creator</h1>
-        <p className="lede">
-          Upload or generate artwork for soft enamel pins, then get two outputs: a transparent
-          stroke-outline PNG and a flat-color vector SVG snapped to a pin-ready PMS chart.
-        </p>
-      </header>
-
-      <div className="layout">
-        <aside className="panel">
-          <div className="tabs source-tabs" role="tablist" aria-label="Source">
-            <button
-              type="button"
-              className={`tab ${sourceMode === 'upload' ? 'active' : ''}`}
-              onClick={() => setSourceMode('upload')}
-            >
-              Upload
-            </button>
-            <button
-              type="button"
-              className={`tab ${sourceMode === 'ai' ? 'active' : ''}`}
-              onClick={() => setSourceMode('ai')}
-            >
-              AI generate
-            </button>
-          </div>
-
-          {sourceMode === 'upload' ? (
-            <>
-              <h2>Artwork</h2>
-              <Dropzone onFile={onFile} disabled={busy} />
-            </>
-          ) : (
-            <AiGenerate onGenerate={onGenerate} disabled={busy} />
-          )}
-
-          <DualControls
-            settings={settings}
-            onChange={setSettings}
-            disabled={busy}
-          />
-
+      <header className="top-bar">
+        <div className="brand-block">
+          <p className="eyebrow">Outline · Vector · Proof</p>
+          <h1 className="brand">Pin Proof Studio</h1>
+        </div>
+        <nav className="stepper" aria-label="Mode">
           <button
             type="button"
-            className="btn btn-secondary chart-btn"
-            onClick={() => setChartOpen(true)}
+            className={`step ${mode === 'studio' ? 'active' : ''}`}
+            onClick={() => setMode('studio')}
           >
-            Browse PMS chart ({getPmsChartSize()})
+            Studio
           </button>
+          <button
+            type="button"
+            className={`step ${mode === 'prompt' ? 'active' : ''}`}
+            onClick={() => setMode('prompt')}
+          >
+            Prompt producer
+          </button>
+        </nav>
+      </header>
 
-          {result && (
-            <PaletteMerge
-              palette={result.vector.palette}
-              merges={merges}
-              onChangeMerges={onMergesChange}
-              onOverridePms={onOverridePms}
-              disabled={busy}
-            />
-          )}
+      <p className={`status-bar ${error ? 'error' : ''}`}>{statusText}</p>
 
-          <div className="actions">
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={onApply}
-              disabled={!sourceImage || busy}
-            >
-              {busy ? 'Processing…' : 'Reprocess'}
-            </button>
-            <button
-              type="button"
-              className="btn btn-secondary"
-              onClick={downloadOutline}
-              disabled={!result || busy}
-            >
-              Download outline PNG
-            </button>
-            <button
-              type="button"
-              className="btn btn-secondary"
-              onClick={downloadVector}
-              disabled={!result || busy}
-            >
-              Download vector SVG
-            </button>
-          </div>
-        </aside>
-
-        <section className="panel preview-panel">
-          <div className="meta-bar">
-            <div className="tabs" role="tablist" aria-label="Preview mode">
+      {mode === 'prompt' ? (
+        <div className="studio studio-prompt">
+          <aside className="panel sidebar">
+            <h2>External generator</h2>
+            <PromptProducer />
+          </aside>
+          <section className="panel main-stage">
+            <div className="empty-state hero-empty">
+              <h3>Generate elsewhere</h3>
+              <p>
+                Copy a prompt → make art in Grok / Midjourney / Flux / ChatGPT → come back
+                to <strong>Studio</strong> and upload. We turn it into outline, flat vector,
+                and a combined proof (fills + lines).
+              </p>
               <button
                 type="button"
-                className={`tab ${viewMode === 'vector' ? 'active' : ''}`}
-                onClick={() => setViewMode('vector')}
-                disabled={!result}
+                className="btn btn-primary"
+                onClick={() => setMode('studio')}
               >
-                Vector
-              </button>
-              <button
-                type="button"
-                className={`tab ${viewMode === 'outline' ? 'active' : ''}`}
-                onClick={() => setViewMode('outline')}
-                disabled={!result}
-              >
-                Outline
-              </button>
-              <button
-                type="button"
-                className={`tab ${viewMode === 'source' ? 'active' : ''}`}
-                onClick={() => setViewMode('source')}
-                disabled={!sourceUrl}
-              >
-                Source
+                Go to Studio →
               </button>
             </div>
-            <p className={`status ${error ? 'error' : ''}`}>{statusText}</p>
-          </div>
+          </section>
+        </div>
+      ) : (
+        <div className="studio studio-refine">
+          <aside className="panel sidebar">
+            <h2>Source art</h2>
+            <Dropzone onFile={onFile} disabled={busy} />
+            <p className="hint">
+              Upload concept art (from your external generator). Pipeline: outline plate →
+              flat fills → combined proof.
+            </p>
 
-          <Preview
-            viewMode={viewMode}
-            sourceUrl={sourceUrl}
-            result={result}
-            busy={busy || isPending}
-          />
-        </section>
-      </div>
+            {sourceImage && (
+              <>
+                <DualControls
+                  settings={settings}
+                  onChange={onSettingsChange}
+                  disabled={busy && !liveBusy}
+                  live
+                />
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-block chart-btn"
+                  onClick={() => setChartOpen(true)}
+                >
+                  PMS chart ({getPmsChartSize()})
+                </button>
+                {result && (
+                  <PaletteMerge
+                    palette={result.vector.palette}
+                    merges={merges}
+                    onChangeMerges={onMergesChange}
+                    onOverridePms={onOverridePms}
+                    disabled={busy || liveBusy}
+                  />
+                )}
+                <div className="actions">
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-block"
+                    onClick={downloadProof}
+                    disabled={!result || busy}
+                  >
+                    Download proof PNG
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-block"
+                    onClick={downloadOutline}
+                    disabled={!result || busy}
+                  >
+                    Download outline
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-block"
+                    onClick={downloadVector}
+                    disabled={!result || busy}
+                  >
+                    Download vector SVG
+                  </button>
+                </div>
+              </>
+            )}
+          </aside>
+
+          <section className="panel main-stage">
+            {sourceImage ? (
+              <>
+                <div className="meta-bar">
+                  <div className="segmented" role="tablist" aria-label="Preview">
+                    {(
+                      [
+                        ['proof', 'Proof'],
+                        ['outline', 'Outline'],
+                        ['vector', 'Vector'],
+                        ['source', 'Source'],
+                      ] as const
+                    ).map(([id, label]) => (
+                      <button
+                        key={id}
+                        type="button"
+                        role="tab"
+                        className={`seg ${viewMode === id ? 'active' : ''}`}
+                        onClick={() => setViewMode(id)}
+                        disabled={id !== 'source' && !result}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  {(liveBusy || busy) && (
+                    <span className="pill-live">
+                      <span className="live-dot" /> Updating
+                    </span>
+                  )}
+                </div>
+                <Preview
+                  viewMode={viewMode}
+                  sourceUrl={sourceUrl}
+                  result={result}
+                  busy={(busy || isPending) && !result}
+                />
+              </>
+            ) : (
+              <div className="empty-state hero-empty">
+                <h3>Editor, not generator</h3>
+                <p>
+                  Build a prompt in <strong>Prompt producer</strong>, generate art elsewhere,
+                  then upload here. Output plates: outline · flat vector · combined proof —
+                  same path as your elephant jack-in-the-box set.
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={() => setMode('prompt')}
+                >
+                  Open prompt producer
+                </button>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
 
       <PmsChartModal
         open={chartOpen}
@@ -343,14 +403,4 @@ function downloadBlob(blob: Blob, filename: string) {
   a.download = filename
   a.click()
   URL.revokeObjectURL(url)
-}
-
-function slugify(text: string): string {
-  return (
-    text
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '')
-      .slice(0, 48) || 'ai-artwork'
-  )
 }
